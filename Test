@@ -1,0 +1,366 @@
+"""
+Scalable Graph Semantic Retriever + Hybrid Retriever
+- Build a NetworkX knowledge graph from repo (cross-file import resolution)
+- Precompute node embeddings (batched)
+- Vector pre-filter to limit candidate set
+- Graph expansion with depth + decay
+- Hybrid scoring and LangChain BaseRetriever wrapper
+"""
+
+import os
+import ast
+from typing import Dict, List, Tuple, Optional
+import math
+import itertools
+
+import networkx as nx
+import numpy as np
+from langchain.docstore.document import Document
+from langchain.schema.retriever import BaseRetriever
+from pydantic import BaseModel, Field
+
+# replace with your preferred embeddings class
+from langchain_openai import OpenAIEmbeddings
+
+# ---------- 1) Build cross-file code graph (classes, functions, methods) ----------
+def get_module_name(filepath: str, root_dir: str) -> str:
+    rel = os.path.relpath(filepath, root_dir)
+    return rel.replace(os.sep, ".").replace(".py", "")
+
+def parse_import_aliases(tree: ast.AST) -> Dict[str, str]:
+    """
+    Return a simple alias map: local_name -> fully_qualified_module_or_symbol
+    e.g. from base import BaseModel  => {"BaseModel": "base.BaseModel"}
+          import models as m         => {"m": "models"}
+    This is a heuristic resolver (works for common patterns).
+    """
+    alias_map = {}
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module
+            if not module:
+                continue
+            for alias in node.names:
+                local = alias.asname or alias.name
+                alias_map[local] = f"{module}.{alias.name}"
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name
+                alias_map[local] = alias.name
+    return alias_map
+
+def build_code_graph(code_dir: str) -> nx.DiGraph:
+    """
+    Walk code_dir and build a global directed graph.
+    Nodes: fully-qualified identifiers like module.Class or module.func or module.Class.method
+    Node attributes: type, file, docstring, code (optional short)
+    Edges: 'inherits', 'has_method', 'defines' (file->node), and later optionally 'calls'
+    """
+    G = nx.DiGraph()
+
+    # first pass: collect AST, alias maps, and class/function defs
+    file_trees = {}
+    for root, _, files in os.walk(code_dir):
+        if ".ipynb_checkpoints" in root:
+            continue
+        for fname in files:
+            if not fname.endswith(".py"):
+                continue
+            path = os.path.join(root, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    src = f.read()
+                tree = ast.parse(src)
+                file_trees[path] = {"tree": tree, "src": src, "module": get_module_name(path, code_dir)}
+            except Exception:
+                # skip unparsable files
+                continue
+
+    # second pass: add nodes and edges (resolve simple imports)
+    for path, info in file_trees.items():
+        tree = info["tree"]
+        src = info["src"]
+        module = info["module"]
+        alias_map = parse_import_aliases(tree)
+
+        # add file node (optional)
+        file_node = f"{module}.__file__"
+        G.add_node(file_node, type="file", file=path, docstring="", code="")
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                qname = f"{module}.{node.name}"
+                doc = ast.get_docstring(node) or ""
+                # small code extract: top-level class definition lines
+                start = node.lineno - 1
+                end = getattr(node, "end_lineno", start + 1)
+                code_snippet = "\n".join(src.splitlines()[start:end])
+                G.add_node(qname, type="class", file=path, docstring=doc, code=code_snippet)
+                G.add_edge(file_node, qname, relation="defines")
+
+                # inherits edges (try to resolve bases via alias_map)
+                for base in node.bases:
+                    if isinstance(base, ast.Name):
+                        base_id = base.id
+                        resolved = alias_map.get(base_id, base_id)
+                        # If resolved contains a dot, assume it's module.Class; otherwise keep as name
+                        G.add_edge(resolved, qname, relation="inherits")
+                    elif isinstance(base, ast.Attribute):
+                        # attribute like module.BaseModel
+                        if isinstance(base.value, ast.Name):
+                            resolved = f"{base.value.id}.{base.attr}"
+                            resolved = alias_map.get(base.value.id, base.value.id) + f".{base.attr}" if base.value.id in alias_map else resolved
+                            G.add_edge(resolved, qname, relation="inherits")
+                        else:
+                            G.add_edge(base.attr, qname, relation="inherits")
+
+                # methods
+                for item in getattr(node, "body", []):
+                    if isinstance(item, ast.FunctionDef):
+                        method_name = f"{qname}.{item.name}"
+                        mdoc = ast.get_docstring(item) or ""
+                        s = item.lineno - 1
+                        e = getattr(item, "end_lineno", s + 1)
+                        code_snip = "\n".join(src.splitlines()[s:e])
+                        G.add_node(method_name, type="method", file=path, docstring=mdoc, code=code_snip)
+                        G.add_edge(qname, method_name, relation="has_method")
+
+            elif isinstance(node, ast.FunctionDef):
+                # top-level function
+                # ensure it's not the method already handled (we get them from walk, so filter with parent)
+                # quick heuristic: if parent is Module (not ClassDef) then it's top-level
+                # ast doesn't provide parent links here; naive approach: add all and de-duplicate names later by module prefix
+                # we prefix by module to keep fully qualified
+                qname = f"{module}.{node.name}"
+                doc = ast.get_docstring(node) or ""
+                s = node.lineno - 1
+                e = getattr(node, "end_lineno", s + 1)
+                code_snip = "\n".join(src.splitlines()[s:e])
+                # If method node already exists (rare), this will just be same name
+                if not G.has_node(qname):
+                    G.add_node(qname, type="function", file=path, docstring=doc, code=code_snip)
+                    G.add_edge(file_node, qname, relation="defines")
+
+    # Optionally: prune nodes without doc/code if you want
+    return G
+
+# ---------- 2) GraphSemanticSearcher: node embeddings + semantic search ----------
+class GraphSemanticSearcher:
+    def __init__(self, graph: nx.DiGraph, embeddings=None, batch_size: int = 64):
+        """
+        Precompute node embeddings for (docstring + code) and answer semantic queries.
+        - graph: networkx DiGraph with nodes containing 'docstring' and 'code' attributes
+        - embeddings: LangChain embeddings (must have embed_documents & embed_query)
+        """
+        self.graph = graph
+        self.embeddings = embeddings or OpenAIEmbeddings(model="text-embedding-3-small")
+        self.batch_size = batch_size
+
+        # Prepare node texts and ids
+        self.node_ids: List[str] = []
+        self.node_texts: List[str] = []
+        self.node_meta: List[Dict] = []
+        for node, data in self.graph.nodes(data=True):
+            doc = data.get("docstring", "") or ""
+            code = data.get("code", "") or ""
+            summary = data.get("summary", "") or ""
+            text = (summary + "\n" + doc + "\n" + code).strip()
+            if not text:
+                # skip nodes with no textual content (optionally keep)
+                continue
+            self.node_ids.append(node)
+            self.node_texts.append(text)
+            self.node_meta.append({"node": node, "file": data.get("file"), "type": data.get("type")})
+
+        # Batch embed all node_texts
+        if self.node_texts:
+            # embed_documents often supports batching; call in chunks
+            all_embeddings = []
+            for i in range(0, len(self.node_texts), self.batch_size):
+                batch = self.node_texts[i : i + self.batch_size]
+                emb_batch = self.embeddings.embed_documents(batch)
+                all_embeddings.extend(emb_batch)
+            self.node_embeddings = np.array(all_embeddings)
+        else:
+            self.node_embeddings = np.array([])
+
+    def _cosine_scores(self, query_vec: np.ndarray) -> np.ndarray:
+        if self.node_embeddings.size == 0:
+            return np.array([])
+        # normalize to avoid repeated norms
+        q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
+        norms = np.linalg.norm(self.node_embeddings, axis=1, keepdims=True) + 1e-12
+        node_norms = self.node_embeddings / norms
+        # dot product for cosine
+        scores = node_norms.dot(q)
+        return scores  # shape (n_nodes,)
+
+    def search(self, query: str, top_n: int = 10) -> List[Tuple[str, float]]:
+        """
+        Return list of (node_id, score) sorted by score desc.
+        Scores are cosine similarity between query and node text embeddings.
+        """
+        if self.node_embeddings.size == 0:
+            return []
+
+        qvec = np.array(self.embeddings.embed_query(query))
+        sims = self._cosine_scores(qvec)  # vector of scores
+        idxs = np.argsort(-sims)[: top_n]
+        results = [(self.node_ids[i], float(sims[i])) for i in idxs]
+        return results
+
+# ---------- 3) Scalable Hybrid Retriever (BaseRetriever-compatible) ----------
+class ScalableHybridRetriever(BaseRetriever, BaseModel):
+    """
+    Hybrid retriever:
+    - vectorstore: existing vectorstore (FAISS/Chroma) supporting similarity_search_with_score
+    - graph_searcher: GraphSemanticSearcher instance
+    - prefilter_k: how many vector hits to prefilter (controls scale)
+    - expand_depth: graph expansion hops from each candidate
+    - expand_decay: score multiplier per hop (e.g., 0.8)
+    - final_k: number of documents to return
+    """
+    vectorstore: object
+    graph_searcher: GraphSemanticSearcher
+    prefilter_k: int = Field(default=50)
+    expand_depth: int = Field(default=1)
+    expand_decay: float = Field(default=0.8)
+    final_k: int = Field(default=10)
+    alpha: float = Field(default=0.6)  # weight for vector vs graph
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(self, query: str, run_manager=None) -> List[Document]:
+        # 1) Vector pre-filter (fast): get top-N candidate documents (doc objects + raw scores)
+        # vectorstore should support similarity_search_with_score(query, k)
+        vec_candidates = []
+        try:
+            vec_candidates = self.vectorstore.similarity_search_with_score(query, k=self.prefilter_k)
+            # vec_candidates: List[(Document, float_score)]
+        except Exception:
+            # fallback to plain similarity_search (no score)
+            docs = self.vectorstore.similarity_search(query, k=self.prefilter_k)
+            # assign a decaying pseudo-score based on rank
+            vec_candidates = [(d, float(self.prefilter_k - i)) for i, d in enumerate(docs)]
+
+        # Normalize vector scores into 0..1
+        vec_scores = [s for _, s in vec_candidates]
+        max_vec = max(vec_scores) if vec_scores else 1.0
+        vec_candidates = [(d, (s / max_vec) if max_vec > 0 else 0.0) for d, s in vec_candidates]
+
+        # 2) Graph semantic hits for the query (top small N of node ids + scores)
+        graph_hits = self.graph_searcher.search(query, top_n=math.ceil(self.prefilter_k / 5))
+        # graph_hits: List[(node_id, score)]
+
+        # Convert vector candidate Documents to canonical node ids if their metadata contains them
+        # This allows merging graph and vector results by node id
+        node_score_map: Dict[str, float] = {}
+        node_doc_map: Dict[str, Document] = {}
+
+        # Seed from vector candidates: try use metadata 'node' or fallback to (file+name)
+        for doc, score in vec_candidates:
+            meta = doc.metadata or {}
+            node_id = meta.get("node") or meta.get("name") or f"{meta.get('filepath','')}/{doc.page_content[:50]}"
+            # prefer highest score
+            if node_id not in node_score_map or node_score_map[node_id] < score * self.alpha:
+                node_score_map[node_id] = score * self.alpha
+                # attach doc but add node metadata for downstream
+                enriched_meta = dict(meta)
+                enriched_meta.setdefault("node", node_id)
+                enriched_meta.setdefault("source", "vector")
+                node_doc_map[node_id] = Document(page_content=doc.page_content, metadata=enriched_meta)
+
+        # Seed from graph hits
+        for node_id, g_score in graph_hits:
+            # map this node to a Document constructed from graph node text & metadata
+            gdata = self.graph_searcher.graph.nodes.get(node_id, {})
+            # build a presentable page_content
+            page_content = (gdata.get("summary", "") + "\n" + gdata.get("docstring", "") + "\n" + gdata.get("code", "")).strip()
+            doc = Document(page_content=page_content, metadata={"node": node_id, "file": gdata.get("file"), "type": gdata.get("type")})
+            # weighted graph score
+            weighted_g_score = (1 - self.alpha) * (g_score)
+            if node_id not in node_score_map or node_score_map[node_id] < weighted_g_score:
+                node_score_map[node_id] = max(node_score_map.get(node_id, 0.0), weighted_g_score)
+                node_doc_map[node_id] = doc
+
+        # 3) Graph expansion: from each seeded node, expand neighbors up to expand_depth with decayed scores
+        # limit expansion to a bounded set: nodes seeded by vector + graph hits
+        seeds = list(node_score_map.keys())
+        # BFS-like expansion with decay
+        for seed in seeds:
+            seed_score = node_score_map.get(seed, 0.0)
+            frontier = [(seed, 0)]  # (node, depth)
+            visited = set([seed])
+            while frontier:
+                current, depth = frontier.pop(0)
+                if depth >= self.expand_depth:
+                    continue
+                # neighbors (both successors and predecessors for undirected relevance)
+                neighbors = itertools.chain(self.graph_searcher.graph.predecessors(current), self.graph_searcher.graph.successors(current))
+                for nb in neighbors:
+                    if nb in visited:
+                        continue
+                    visited.add(nb)
+                    # compute propagated score
+                    propagated = seed_score * (self.expand_decay ** (depth + 1))
+                    # create Document for neighbor if not present
+                    nbdata = self.graph_searcher.graph.nodes.get(nb, {})
+                    nb_text = (nbdata.get("summary","") + "\n" + nbdata.get("docstring","") + "\n" + nbdata.get("code","")).strip()
+                    nb_doc = Document(page_content=nb_text, metadata={"node": nb, "file": nbdata.get("file"), "type": nbdata.get("type"), "source":"graph_expanded"})
+                    # merge score into maps
+                    if node_score_map.get(nb, 0.0) < propagated:
+                        node_score_map[nb] = propagated
+                        node_doc_map[nb] = nb_doc
+                    # add to frontier for deeper expansion
+                    frontier.append((nb, depth + 1))
+
+        # 4) Final ranking: sort node_score_map by score and return top final_k Documents
+        ranked = sorted(node_score_map.items(), key=lambda x: x[1], reverse=True)[: self.final_k]
+        results = []
+        for node_id, score in ranked:
+            doc = node_doc_map.get(node_id)
+            # attach score into metadata for debugging / downstream use
+            meta = dict(doc.metadata or {})
+            meta["_hybrid_score"] = float(score)
+            results.append(Document(page_content=doc.page_content, metadata=meta))
+
+        return results
+
+    async def _aget_relevant_documents(self, query: str, run_manager=None) -> List[Document]:
+        return self._get_relevant_documents(query, run_manager=run_manager)
+
+# ---------- 4) Usage Example ----------
+if __name__ == "__main__":
+    # 1) Build graph from repo root
+    REPO_ROOT = "./my_codebase"  # change to your repo folder
+    print("Building graph...")
+    G = build_code_graph(REPO_ROOT)
+    # Optionally serialize: nx.write_gpickle(G, "code_graph.gpickle")
+
+    # 2) Create embeddings model
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+    # 3) Build GraphSemanticSearcher (precomputes node embeddings)
+    print("Indexing graph node texts (this may take time)...")
+    graph_searcher = GraphSemanticSearcher(G, embeddings=embeddings, batch_size=64)
+
+    # 4) Create / load vectorstore (FAISS/Chroma) already indexed over Documents representing functions/classes
+    # vectorstore = FAISS.load_local("./faiss_index", embeddings)
+    # For demonstration assume vectorstore variable exists and implements similarity_search_with_score
+    vectorstore = None  # <- replace with your vectorstore instance
+
+    # 5) Create Hybrid retriever
+    retriever = ScalableHybridRetriever(
+        vectorstore=vectorstore,
+        graph_searcher=graph_searcher,
+        prefilter_k=50,
+        expand_depth=1,
+        expand_decay=0.8,
+        final_k=10,
+        alpha=0.6
+    )
+
+    # 6) Run a test query (replace once vectorstore is available)
+    # results = retriever._get_relevant_documents("persist user to database")
+    # for r in results:
+    #     print(r.metadata, r.page_content[:400])

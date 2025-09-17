@@ -1,0 +1,65 @@
+from typing import List
+from langchain.schema import Document
+from langchain.schema.retriever import BaseRetriever
+from pydantic import BaseModel, Field
+
+class HybridRetriever(BaseRetriever, BaseModel):
+    vectorstore: object  # your vectorstore object
+    graph_searcher: object  # your graph semantic searcher
+    k: int = Field(default=5)
+    alpha: float = Field(default=0.6)
+
+    class Config:
+        arbitrary_types_allowed = True  # allows non-pydantic types
+
+    def _get_relevant_documents(self, query: str, run_manager=None) -> List[Document]:
+        # --- Vector search ---
+        vec_results = self.vectorstore.similarity_search_with_score(query, k=self.k)
+
+        # --- Graph search ---
+        graph_results = self.graph_searcher.search(query, k=self.k)
+
+        # --- Normalize vector scores ---
+        if vec_results:
+            max_vec = max(score for _, score in vec_results)
+            vec_results = [(doc, score / max_vec) for doc, score in vec_results]
+
+        combined = {}
+
+        # --- Merge vector results ---
+        for doc, score in vec_results:
+            key = doc.metadata.get("node") or doc.metadata.get("file") or doc.page_content[:50]
+            combined[key] = (doc, self.alpha * score)
+
+        # --- Merge graph results ---
+        for doc, score in graph_results:
+            key = doc.metadata.get("node") or doc.metadata.get("file") or doc.page_content[:50]
+            if key in combined:
+                prev_doc, prev_score = combined[key]
+                combined[key] = (doc, prev_score + (1 - self.alpha) * score)
+            else:
+                combined[key] = (doc, (1 - self.alpha) * score)
+
+        # --- Sort by score ---
+        ranked = sorted(combined.values(), key=lambda x: x[1], reverse=True)
+        return [doc for doc, _ in ranked[:self.k]]
+
+    async def _aget_relevant_documents(self, query: str, run_manager=None) -> List[Document]:
+
+
+hybrid_retriever = HybridRetriever(vectorstore=vectorstore, graph_searcher=graph_searcher, k=5, alpha=0.7)
+
+# Works with LangGraph tool wrapper
+from langchain.tools.retriever import create_retriever_tool
+
+retriever_tool = create_retriever_tool(
+    retriever=hybrid_retriever,
+    name="hybrid_code_retriever",
+    description="Hybrid semantic + graph search over codebase"
+)
+
+# Direct retrieval
+docs = hybrid_retriever.invoke("persist user to database")
+for d in docs:
+    print(d.metadata, d.page_content[:200])
+        return self._get_relevant_documents(query, run_manager=run_manager)

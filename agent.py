@@ -1,166 +1,114 @@
 from langgraph.graph import StateGraph, END
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
+from langchain.agents import create_retriever_tool
+from typing import TypedDict, List, Dict
 
-# -----------------------------------
-# Shared State
-# -----------------------------------
-class AgentState(dict):
+# ----------------------------
+# Define State
+# ----------------------------
+class State(TypedDict):
     query: str
-    retrieved_docs: list
-    retrieval_verdict: str
+    retrieved_docs: List[str]
     generated_code: str
-    code_verdict: str
-    execution_result: str
+    feedback: str
+    retry_count: int
 
-
-# -----------------------------------
-# Retriever Agent (Hybrid: Vector + Graph)
-# -----------------------------------
-def retriever_agent(state: AgentState) -> AgentState:
-    query = state["query"]
-
-    # Replace with your hybrid retriever
-    results = hybrid_retriever.get_relevant_documents(query)
-    state["retrieved_docs"] = results
-    return state
-
-
-# -----------------------------------
-# Retrieval Critic Agent
-# -----------------------------------
+# ----------------------------
+# Agents Setup
+# ----------------------------
 llm = ChatOpenAI(model="gpt-4o-mini")
 
-def retrieval_critic_agent(state: AgentState) -> AgentState:
-    query = state["query"]
-    docs = state["retrieved_docs"]
+# Retriever Tool (Hybrid: vector + graph)
+# Assume you already built `hybrid_retriever`
+retriever_tool = create_retriever_tool(
+    hybrid_retriever,
+    "code_retriever",
+    "Retrieve relevant functions/classes/docstrings from the codebase"
+)
 
-    context = "\n\n".join([d.page_content for d in docs])
+# Code Generator Prompt
+codegen_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a senior Python engineer. Generate robust code using retrieved docs."),
+    ("user", "Query: {query}\n\nRetrieved Docs:\n{retrieved_docs}")
+])
 
-    prompt = f"""
-You are a codebase expert.
-User query: {query}
+# Critic Prompt
+critic_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a critical reviewer. Check if retrieved docs are sufficient."),
+    ("user", "Query: {query}\n\nGenerated Code:\n{generated_code}\n\nDocs:\n{retrieved_docs}\n\n"
+             "Answer with 'SUFFICIENT' or 'INSUFFICIENT' and explain why.")
+])
 
-Retrieved context:
-{context}
+# Query Expander Prompt
+query_expander_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Rewrite the user query to improve retrieval for code context."),
+    ("user", "Original query: {query}\n\nFeedback: {feedback}")
+])
 
-Check if the retrieved context is sufficient to answer the query.
+# ----------------------------
+# Nodes (Graph Functions)
+# ----------------------------
+def retrieve_code(state: State):
+    docs = retriever_tool.invoke(state["query"])
+    return {"retrieved_docs": [d.page_content for d in docs]}
 
-Answer strictly with:
-- "sufficient" if the retrieved docs clearly contain the needed classes/functions.
-- "insufficient" if critical pieces are missing or irrelevant.
-"""
+def generate_code(state: State):
+    result = llm.invoke(
+        codegen_prompt.format(
+            query=state["query"],
+            retrieved_docs="\n---\n".join(state["retrieved_docs"])
+        )
+    )
+    return {"generated_code": result.content}
 
-    verdict = llm.invoke(prompt).content.strip().lower()
-    state["retrieval_verdict"] = verdict
-    return state
+def critic_review(state: State):
+    review = llm.invoke(
+        critic_prompt.format(
+            query=state["query"],
+            generated_code=state["generated_code"],
+            retrieved_docs="\n---\n".join(state["retrieved_docs"])
+        )
+    )
+    return {"feedback": review.content}
 
+def retry_retrieval(state: State):
+    # If critic said insufficient, retry either by graph expansion or query expansion
+    if "SUFFICIENT" in state["feedback"]:
+        return END
+    elif state["retry_count"] >= 2:  # fail-safe limit
+        return END
+    else:
+        # Query Expansion
+        expanded = llm.invoke(
+            query_expander_prompt.format(
+                query=state["query"],
+                feedback=state["feedback"]
+            )
+        )
+        new_query = expanded.content.strip()
+        return {"query": new_query, "retry_count": state["retry_count"] + 1}
 
-# -----------------------------------
-# Code Generator Agent
-# -----------------------------------
-def code_generator_agent(state: AgentState) -> AgentState:
-    query = state["query"]
-    docs = state["retrieved_docs"]
+# ----------------------------
+# Build Graph
+# ----------------------------
+workflow = StateGraph(State)
 
-    context = "\n\n".join([d.page_content for d in docs])
+workflow.add_node("retriever", retrieve_code)
+workflow.add_node("codegen", generate_code)
+workflow.add_node("critic", critic_review)
+workflow.add_node("retry", retry_retrieval)
 
-    prompt = f"""
-You are a coding assistant.
-User query: {query}
+workflow.set_entry_point("retriever")
+workflow.add_edge("retriever", "codegen")
+workflow.add_edge("codegen", "critic")
+workflow.add_edge("critic", "retry")
 
-Relevant code snippets from the codebase:
-{context}
+# Retry either loops back to retriever or ends
+workflow.add_conditional_edges(
+    "retry",
+    lambda state: END if ("SUFFICIENT" in state["feedback"] or state["retry_count"] >= 2) else "retriever",
+    {"__default__": "retriever", END: END}
+)
 
-Generate Python code that satisfies the query using only the retrieved classes and functions.
-"""
-
-    code = llm.invoke(prompt).content
-    state["generated_code"] = code
-    return state
-
-
-# -----------------------------------
-# Code Critic Agent
-# -----------------------------------
-def code_critic_agent(state: AgentState) -> AgentState:
-    query = state["query"]
-    code = state["generated_code"]
-
-    prompt = f"""
-You are a senior code reviewer.
-User query: {query}
-
-Generated code:
-{code}
-
-Check:
-1. Does this code fully satisfy the query?
-2. Does it correctly use the retrieved functions/classes?
-
-Answer strictly with either:
-- "sufficient"
-- "insufficient"
-"""
-
-    verdict = llm.invoke(prompt).content.strip().lower()
-    state["code_verdict"] = verdict
-    return state
-
-
-# -----------------------------------
-# Execution Agent
-# -----------------------------------
-def execution_agent(state: AgentState) -> AgentState:
-    code = state["generated_code"]
-
-    try:
-        exec_locals = {}
-        exec(code, {}, exec_locals)
-        state["execution_result"] = "Execution succeeded"
-    except Exception as e:
-        state["execution_result"] = f"Execution error: {e}"
-
-    return state
-
-
-# -----------------------------------
-# LangGraph Wiring
-# -----------------------------------
-workflow = StateGraph(AgentState)
-
-workflow.add_node("Retriever", retriever_agent)
-workflow.add_node("RetrievalCritic", retrieval_critic_agent)
-workflow.add_node("CodeGen", code_generator_agent)
-workflow.add_node("CodeCritic", code_critic_agent)
-workflow.add_node("Executor", execution_agent)
-
-workflow.set_entry_point("Retriever")
-
-# Retriever → RetrievalCritic
-workflow.add_edge("Retriever", "RetrievalCritic")
-
-# RetrievalCritic branching
-def check_retrieval(state: AgentState):
-    return "CodeGen" if state["retrieval_verdict"] == "sufficient" else "Retriever"
-
-workflow.add_conditional_edges("RetrievalCritic", check_retrieval, {
-    "CodeGen": "CodeGen",
-    "Retriever": "Retriever"
-})
-
-# CodeGen → CodeCritic
-workflow.add_edge("CodeGen", "CodeCritic")
-
-# CodeCritic branching
-def check_code(state: AgentState):
-    return "Executor" if state["code_verdict"] == "sufficient" else "CodeGen"
-
-workflow.add_conditional_edges("CodeCritic", check_code, {
-    "Executor": "Executor",
-    "CodeGen": "CodeGen"
-})
-
-# Executor → END
-workflow.add_edge("Executor", END)
-
-app = workflow.compile()
+graph = workflow.compile()
